@@ -3,7 +3,8 @@ package tcp
 import (
 	"fmt"
 	"time"
-
+	//linked list library to buffer out-of-order tcp packets
+	"container/list"
 	"github.com/elastic/beats/libbeat/common"
 	"github.com/elastic/beats/libbeat/logp"
 
@@ -62,6 +63,13 @@ func (tcp *Tcp) findStream(k common.HashableIpPortTuple) *TcpConnection {
 	return nil
 }
 
+//payload buffer (value in the list of unordered list)
+type payload struct {
+	tcphdr layers.TCP
+	pkt    protos.Packet
+	seq    uint32
+}
+
 type TcpConnection struct {
 	id       uint32
 	tuple    *common.IpPortTuple
@@ -70,7 +78,10 @@ type TcpConnection struct {
 	tcp      *Tcp
 
 	lastSeq [2]uint32
-
+	//temporary list for unordered packets
+	alist [2]list.List
+	//number of fins recieved to deem a connection valid to close
+	fincnt uint32
 	// protocols private data
 	data protos.ProtocolData
 }
@@ -100,8 +111,8 @@ func (stream *TcpStream) addPacket(pkt *protos.Packet, tcphdr *layers.TCP) {
 	if len(pkt.Payload) > 0 {
 		conn.data = mod.Parse(pkt, &conn.tcptuple, stream.dir, conn.data)
 	}
-
-	if tcphdr.FIN {
+	//atleast two fins should be seen to close connection(one in each direction)
+	if tcphdr.FIN && conn.fincnt >= 2 {
 		conn.data = mod.ReceivedFin(&conn.tcptuple, stream.dir, conn.data)
 	}
 }
@@ -131,8 +142,12 @@ func (tcp *Tcp) Process(tcphdr *layers.TCP, pkt *protos.Packet) {
 		debugf("pkt.start_seq=%v pkt.last_seq=%v stream.last_seq=%v (len=%d)",
 			tcp_start_seq, tcp_seq, lastSeq, len(pkt.Payload))
 	}
-
-	if len(pkt.Payload) > 0 && lastSeq != 0 {
+	if tcphdr.FIN {
+		//count number of fins received(should we move this to addPacket, because retransmissions can cause issue)
+		conn.fincnt += 1
+	}
+	//if FIN is reordered, it also has o go to the queue
+	if (len(pkt.Payload) > 0 || tcphdr.FIN) && lastSeq != 0 {
 		if tcpSeqBeforeEq(tcp_seq, lastSeq) {
 			if isDebug {
 				debugf("Ignoring retransmitted segment. pkt.seq=%v len=%v stream.seq=%v",
@@ -143,25 +158,59 @@ func (tcp *Tcp) Process(tcphdr *layers.TCP, pkt *protos.Packet) {
 
 		if tcpSeqBefore(lastSeq, tcp_start_seq) {
 			if !created {
-				gap := int(tcp_start_seq - lastSeq)
-				logp.Warn("Gap in tcp stream. last_seq: %d, seq: %d, gap: %d", lastSeq, tcp_start_seq, gap)
-				drop := stream.gapInStream(gap)
-				if drop {
-					if isDebug {
-						debugf("Dropping connection state because of gap")
-					}
-
-					// drop application layer connection state and
-					// update stream_id for app layer analysers using stream_id for lookups
-					conn.id = tcp.getId()
-					conn.data = nil
+				//add out of order packets to buffer alist
+				buffer := &payload{
+					tcphdr: *tcphdr,
+					pkt:    *pkt,
+					seq:    tcp_start_seq,
 				}
+				insertUnordered(&conn.alist[stream.dir], buffer)
+				return
 			}
 		}
 	}
 
-	conn.lastSeq[stream.dir] = tcp_seq
-	stream.addPacket(pkt, tcphdr)
+	if len(pkt.Payload) > 0 || tcphdr.FIN {
+		conn.lastSeq[stream.dir] = tcp_seq
+		stream.addPacket(pkt, tcphdr)
+	}
+	//iterate through list till we hit upon next gap
+	for e := conn.alist[stream.dir].Front(); e != nil; {
+		nexte := e.Next()
+		unOrderedPayload := e.Value.(*payload)
+		if unOrderedPayload.seq < conn.lastSeq[stream.dir] {
+			conn.alist[stream.dir].Remove(e)
+			//Dropping old pkts
+		} else if unOrderedPayload.seq == conn.lastSeq[stream.dir] {
+			tcphdr1 := &unOrderedPayload.tcphdr
+			pkt1 := &unOrderedPayload.pkt
+			conn.alist[stream.dir].Remove(e)
+			tcp_start_seq = tcphdr1.Seq
+			tcp_seq = tcp_start_seq + uint32(len(pkt1.Payload))
+			conn.lastSeq[stream.dir] = tcp_seq
+			stream.addPacket(pkt1, tcphdr1)
+		} else {
+			break
+		}
+		e = nexte
+	}
+}
+
+//insert unordered packets in sorted linked list so that it can behave as a queue
+func insertUnordered(l *list.List, buffer *payload) {
+	if l.Len() == 0 {
+		l.PushFront(buffer)
+		return
+	}
+	for e := l.Front(); e != nil; e = e.Next() {
+		buf := e.Value.(*payload)
+		if buf.seq > buffer.seq {
+			l.InsertBefore(buffer, e)
+			return
+		}
+	}
+	l.PushBack(buffer)
+	return
 }
 
 func (tcp *Tcp) getStream(pkt *protos.Packet) (stream TcpStream, created bool) {
